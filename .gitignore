@@ -6,12 +6,6 @@ dist/
 build/
 *.egg
 
-# Data (too large for git)
-data/
-
-# Training records
-records/
-
 # IDE
 .vscode/
 .idea/
