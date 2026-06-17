@@ -1,0 +1,140 @@
+import torch
+import numpy as np
+import warnings
+from sklearn.cluster import KMeans, k_means
+from sklearn.exceptions import ConvergenceWarning
+
+
+class GranularBall:
+    def __init__(self, data, labels, indices, weights=None):
+        self.data = data
+        self.labels = labels
+        self.indices = np.array([indices]).squeeze().reshape(-1,)
+        self.num_smp, self.dim = data.shape
+
+        if weights is None:
+            self.weights = torch.ones(self.num_smp, dtype=torch.float32, device=data.device)
+        else:
+            self.weights = weights
+        weight_sum = self.weights.sum() + 1e-8  # 加上极小值防止除以0
+        self.center = (self.data * self.weights.unsqueeze(1)).sum(dim=0) / weight_sum
+
+        arr = torch.norm(self.data - self.center, p=2, dim=1)
+
+        self.r = (arr * self.weights).sum() / weight_sum
+
+    def split_balls(self, p):
+        k = max(self.num_smp // p, 1)
+        data = self.data.detach().cpu().numpy()
+        k = min(k, np.unique(data, axis=0).shape[0])
+        if p == 1:
+            y_part = np.arange(data.shape[0])
+        else:
+            kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
+
+            sample_weight = self.weights.detach().cpu().numpy()
+
+            y_part = kmeans.fit_predict(data)
+        y_part = torch.from_numpy(y_part).to(torch.long)
+        sub_balls = []
+        for i in range(k):
+            indices = torch.where(y_part == i)
+            sub_data = self.data[indices]
+            sub_labels = self.labels[indices]
+            sub_indices = self.indices[indices]
+
+            sub_weights = self.weights[indices]
+            new_ball = GranularBall(sub_data, sub_labels, sub_indices, weights=sub_weights)
+            sub_balls.append(new_ball)
+        return sub_balls, y_part
+
+
+class GBList:
+    def __init__(self, data, labels, p=8, weights=None):
+        self.data = data
+        self.labels = labels
+        self.indices = np.arange(data.shape[0])
+        self.y_parts = None
+
+        self.granular_balls = [GranularBall(data, labels, self.indices, weights=weights)]
+
+        self.split_granular_balls(p)
+
+    def __len__(self):
+        return len(self.granular_balls)
+
+    def __getitem__(self, i):
+        return self.granular_balls[i]
+
+    def split_granular_balls(self, p):
+
+        gb_list, y_parts = self[0].split_balls(p)
+        self.granular_balls = gb_list
+        self.y_parts = y_parts
+
+
+    def get_centers(self):
+        return torch.vstack(list(map(lambda x: x.center, self.granular_balls)))
+
+    def get_rs(self):
+        return torch.vstack(list(map(lambda x: x.r, self.granular_balls))).squeeze()
+
+    def get_data(self):
+        list_data = [ball.data for ball in self.granular_balls]
+        list_labels = [ball.labels for ball in self.granular_balls]
+        list_indices = [ball.indices for ball in self.granular_balls]
+        return torch.concat(list_data, dim=0), torch.concat(list_labels, dim=0), torch.concat(list_indices, dim=0)
+
+    def del_ball(self, min_smp=0):
+        T_ball = []
+        for ball in self.granular_balls:
+            if ball.num_smp >= min_smp:
+                T_ball.append(ball)
+        self.granular_balls = T_ball
+        self.data, self.labels, self.indices = self.get_data()
+
+    @torch.no_grad
+    def affinity(self, spread=3):
+        centers = self.get_centers()
+
+        dist = torch.cdist(centers, centers)
+
+        rs = self.get_rs()
+        extra = rs.unsqueeze(0) + rs.unsqueeze(-1)
+        indicate = dist <= extra
+        indicate = torch.where(indicate, 1, 0).type(torch.float32)
+        return indicate
+
+
+class MVGBList:
+    def __init__(self, mv_data, labels, p=8, weight_mask=None):
+        self.num_view = len(mv_data)
+        self.gblists = []
+        for i in range(self.num_view):
+            v_weights = weight_mask[:, i] if weight_mask is not None else None
+            gblist = GBList(mv_data[i], labels, p=p, weights=v_weights)
+            self.gblists.append(gblist)
+
+    def __len__(self):
+        return self.num_view
+
+    def __getitem__(self, i):
+        return self.gblists[i]
+
+
+def contain_same_sample(ball0: GranularBall, ball1: GranularBall):
+    n0, n1 = ball0.num_smp, ball1.num_smp
+    for i in range(n0):
+        for j in range(n1):
+            if ball0.indices[i] == ball1.indices[j]:
+                return True
+    return False
+
+
+def transitive_neighbor_relations(a, k=3):
+    while k > 0:
+        a_ = torch.where(a @ a > 0, 1., 0.)
+        a_ = torch.where(torch.logical_or(a, a_), 1., 0.)
+        a = a_
+        k -= 1
+    return a
